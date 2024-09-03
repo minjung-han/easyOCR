@@ -9,6 +9,7 @@
 # pip install easyocr
 
 
+import cv2
 import easyocr
 import os
 import json
@@ -23,6 +24,8 @@ import datetime
 import threading
 
 import log_info
+import numpy as np
+from scipy.signal import find_peaks
 
 json_failed_cnt = 0
 
@@ -53,14 +56,14 @@ def config_reading(json_file_name):
 
 
 #def perform_ocr(image_path, languages=['en', 'ko']):
-def perform_ocr(image_path, languages, use_gpu):
+def perform_ocr(preprocessed_image, languages, use_gpu):
     """이미지 경로를 받아 OCR을 수행하고 결과를 반환하는 함수"""
     try:
         # EasyOCR Reader 객체 생성
         reader = easyocr.Reader(languages, gpu=use_gpu)  # 지정된 언어 지원
 
         # 이미지에 대해 OCR 수행
-        ocr_results = reader.readtext(image_path)
+        ocr_results = reader.readtext(preprocessed_image)
 
         # 텍스트만 추출
         extracted_texts = [item[1] for item in ocr_results]
@@ -148,8 +151,8 @@ def write_save_json_failed_files(file_path, save_json_failed_path, response):
     try:
         # file_write_lock = threading.Lock()
         # with write_json_failed_file_write_lock:
-            with open(failed_files_path, 'a', encoding='utf-8') as failed_files_file:
-                failed_files_file.write(f"{file_path}, Result description : {exception_message}, File size: {file_size}\n")
+        with open(failed_files_path, 'a', encoding='utf-8') as failed_files_file:
+            failed_files_file.write(f"{file_path}, Result description : {exception_message}, File size: {file_size}\n")
     except Exception as e:
         error_message = f"{failed_files_file} 파일 만드는데에 오류 발생 : {str(e)}"
         logging.error(error_message)
@@ -227,8 +230,8 @@ def save_as_json(file_path, result_path, response, json_data):
         write_save_json_failed_files(file_path, save_json_failed_path, response)
 
     # json_file_name = os.path.join(result_path, f"{uuid_str}.json")
-    json_extension = file_extension.lstrip('.')
-    json_file_name = os.path.join(result_path, f"{file_name}_{json_extension}_{uuid_str}.json")
+    # json_extension = file_extension.lstrip('.')
+    json_file_name = os.path.join(result_path, f"{uuid_str}.json")
 
     try:
         # with open(json_file_name, 'w', encoding='utf-8') as json_file:
@@ -257,8 +260,8 @@ def save_as_json(file_path, result_path, response, json_data):
         try:
             # file_write_lock = threading.Lock()
             # with file_write_lock:
-                with open(json_file_name, 'w', encoding='utf-8') as json_file:
-                    json_file.write(json_string)
+            with open(json_file_name, 'w', encoding='utf-8') as json_file:
+                json_file.write(json_string)
         except Exception as e:
             increment_json_failed_count()
             error_message = f"JSON 파일 생성 중 알 수 없는 오류 발생 : {str(e)}"
@@ -269,15 +272,54 @@ def save_as_json(file_path, result_path, response, json_data):
 
     return json_failed_cnt
 
+# 이미지 전처리
+def preprocess_image(image_path):
+    # 이미지 읽기 및 그레이스케일로 변환
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    
+    # 이미지 히스토그램 계산
+    hist = cv2.calcHist([image], [0], None, [256], [0, 256])
+    hist = hist.flatten()
+    
+    # 히스토그램에서 피크(peak) 찾기
+    peaks, _ = find_peaks(hist, height=0)
 
+    if len(peaks) >= 2:
+        # 피크가 2개 이상인 경우, Otsu의 이진화 적용
+        _, binary_image = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        # 피크가 2개 미만인 경우, 임의의 임계값 T를 기준으로 반복적 이진화
+        T = 127  # 초기 임의의 T
+        while True:
+            # T를 기준으로 두 클래스(밝고 어두운 부분) 나누기
+            foreground = image[image > T]
+            background = image[image <= T]
+            
+            if len(foreground) == 0 or len(background) == 0:
+                break
+
+            # 각 클래스의 평균 계산
+            mean_foreground = np.mean(foreground)
+            mean_background = np.mean(background)
+            
+            # 새로운 T 계산
+            new_T = (mean_foreground + mean_background) / 2
+            
+            # 새로운 T와 기존 T가 거의 동일하면 반복 종료
+            if abs(T - new_T) < 1:
+                break
+            
+            T = new_T
+
+        # 최종 T를 이용한 이진화
+        _, binary_image = cv2.threshold(image, T, 255, cv2.THRESH_BINARY)
+
+    return binary_image
 
 
 
 def main():
     """메인 함수"""
-    #image_path = '/home/nettars/mhpark/slideLayout2_rId3_image5.png'
-    #output_file_path = 'ocr_results.json'
-
 
     try:
         json_data = config_reading('config.json')
@@ -298,10 +340,10 @@ def main():
             ocr_languages = ocr_info['ocr_languages']
 
             root_path = json_data['root_path']
-            source_path = json_data['datainfopath']['target_path']
+            source_path = json_data['datainfopath']['source_path']
             source_path = os.path.join(root_path, source_path)
 
-            el_target_path = json_data['elasticsearch']['el_file_target_path']
+            el_target_path = json_data['elasticsearch']['normal_el_file_target_path']
             el_file_path = json_data['elasticsearch']['el_file_path']
             result_path = os.path.join(root_path, el_target_path, el_file_path)
 
@@ -316,7 +358,7 @@ def main():
                 os.mkdir(log_file_path)
 
             if not os.path.exists(result_path):
-                os.mkdir(result_path)
+                os.makedirs(result_path, exist_ok=True)
 
             if not os.path.exists(log_file_path):
                 os.mkdir(log_file_path)
@@ -334,7 +376,7 @@ def main():
             file_handler.setFormatter(file_formatter)
             file_handler.setLevel(log_level)
             logger.addHandler(file_handler)
-            logging.getLogger("PIL").setLevel(logging.WARNING)
+            logging.getLogger("PIL").setLevel(logging.ERROR)
         
             if log_to_console:
                 console = logging.StreamHandler()
@@ -381,19 +423,28 @@ def main():
 
     count = 0
 # case 1 : 하나씩 하는게 시간 및 리소스 사용량이 적은듯.
+    # for image_file in image_files:
+    #     image_file = preprocess_image(image_file)
+    #     result = perform_ocr(image_file, ocr_languages, use_gpu)
+    #     count += 1
+
+    #     # logging.info("\n----------------------------------------------------------------------------------------")
+    #     # info_message = f"\ncount: {count}\n{image_file}\n{result}"
+    #     # logging.info(info_message)
+    #     # logging.info("----------------------------------------------------------------------------------------\n")
+
+    #     if result != None:
+    #         combined_results.append(result)
+    #         save_as_json(image_file, result_path, result, json_data)
+    
     for image_file in image_files:
-        result = perform_ocr(image_file, ocr_languages, use_gpu)
+        preprocessed_image = preprocess_image(image_file)  # 전처리된 이미지를 얻음
+        result = perform_ocr(preprocessed_image, ocr_languages, use_gpu)  # 전처리된 이미지로 OCR 수행
         count += 1
 
-        logging.info("\n----------------------------------------------------------------------------------------")
-        info_message = f"\ncount: {count}\n{image_file}\n{result}"
-        logging.info(info_message)
-        logging.info("----------------------------------------------------------------------------------------\n")
-
-
-        if result != None:
+        if result is not None:
             combined_results.append(result)
-            save_as_json(image_file, result_path, result, json_data)
+            save_as_json(image_file, result_path, result, json_data)  # 원본 이미지 경로 사용
 
     end_time = time.time()
     total_time = end_time - start_time
